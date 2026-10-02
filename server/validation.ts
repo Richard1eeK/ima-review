@@ -59,6 +59,21 @@ function checkItem(value: unknown) {
     assert(Number(c.state) <= 3 && Number(c.difficulty) <= 10, 'FSRS 卡片状态无效');
   }
 }
+function checkLearningState(value: unknown) {
+  object(value);
+  for (const field of ['learnedAt', 'dueAt']) isoDate(value[field], `learning.${field}`, true);
+  integer(value.version, 'learning.version', 1); integer(value.lapses, 'learning.lapses');
+  assert(typeof value.needsRelearn === 'boolean', 'learning.needsRelearn 无效');
+  assert(value.lastRating === null || ratings.includes(value.lastRating as typeof ratings[number]), '学习评级无效');
+  if (value.card !== null) {
+    object(value.card); isoDate(value.card.due, 'card.due');
+    if (value.card.last_review !== undefined) isoDate(value.card.last_review, 'card.last_review', true);
+    for (const key of ['stability', 'difficulty', 'elapsed_days', 'scheduled_days', 'reps', 'lapses', 'state']) {
+      assert(typeof value.card[key] === 'number' && Number.isFinite(value.card[key]) && Number(value.card[key]) >= 0, `card.${key} 无效`);
+    }
+    assert(Number(value.card.state) <= 3 && Number(value.card.difficulty) <= 10, 'FSRS 卡片状态无效');
+  }
+}
 export function validateBackup(value: unknown): asserts value is BackupData {
   object(value);
   assert(value.format === 'ima-review-backup' && value.version === 1, '不是受支持的 ima-review 备份');
@@ -88,12 +103,20 @@ export function validateBackup(value: unknown): asserts value is BackupData {
     assert(!ratedIds.has(r.answerId), '重复复习评级'); ratedIds.add(r.answerId);
     assert(ratings.includes(r.rating as typeof ratings[number]), '复习评级无效');
     isoDate(r.reviewedAt, 'review.reviewedAt'); isoDate(r.dueAt, 'review.dueAt'); object(r.log);
+    if (r.before !== undefined) checkLearningState(r.before);
   }
   assert(new Set(reviews.map(r => r.id)).size === reviews.length, '重复复习 ID');
   for (const p of value.plans as Record<string, unknown>[]) {
     object(p); text(p.date, 'plan.date', 10); assert(/^\d{4}-\d{2}-\d{2}$/.test(p.date), '计划日期无效');
     strings(p.learnIds, 'plan.learnIds'); strings(p.reviewIds, 'plan.reviewIds');
     if (p.learnedIds !== undefined) strings(p.learnedIds, 'plan.learnedIds');
+    if (p.generation !== undefined) integer(p.generation, 'plan.generation');
+    if (p.learningBefore !== undefined) {
+      object(p.learningBefore);
+      for (const [id, before] of Object.entries(p.learningBefore)) {
+        assert(itemIds.has(id), '学习快照引用不存在的词条'); checkLearningState(before);
+      }
+    }
     assert([...(p.learnIds as string[]), ...(p.reviewIds as string[]), ...((p.learnedIds as string[] | undefined) ?? [])].every(id => itemIds.has(id)), '计划引用不存在的词条');
     assert(Array.isArray(p.questions), '计划题目无效');
     for (const q of p.questions) { object(q); text(q.id, 'question.id', 200); assert(itemIds.has(q.itemId), '题目引用不存在的词条'); text(q.prompt, 'question.prompt'); strings(q.reference, 'question.reference'); checkItem(q.item); }

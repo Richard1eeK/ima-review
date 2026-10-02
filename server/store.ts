@@ -2,9 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync, backup as sqliteBackup } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createEmptyCard, fsrs, Rating, type CardInput } from 'ts-fsrs';
+import { createEmptyCard, fsrs, Rating, type CardInput, type ReviewLogInput } from 'ts-fsrs';
 import { defaultSettings, emptySyncStatus } from '../shared/defaults.ts';
-import type { AnswerInput, AnswerRecord, AnswerUpdate, AppStats, BackupData, BackupFile, DailyPlan, NoteSnapshot, ParsedStudyItem, RatingLabel, ReviewRecord, Settings, StoredDailyPlan, StudyItem, SyncCounts, SyncStatus } from '../shared/types.ts';
+import type { AnswerInput, AnswerRecord, AnswerUpdate, AppStats, BackupData, BackupFile, DailyPlan, DailyResetResult, LearningState, NoteSnapshot, ParsedStudyItem, RatingLabel, ReviewRecord, Settings, StoredDailyPlan, StudyItem, SyncCounts, SyncStatus } from '../shared/types.ts';
 import { assert, AppError } from './errors.ts';
 import { dateKey, kindsFor, makeQuestion, promptFor, referenceFor, stableShuffle } from './questions.ts';
 import { ratings, text, validateBackup, validateSettings } from './validation.ts';
@@ -15,11 +15,16 @@ type Table = typeof tables[number];
 const encode = (value: unknown) => JSON.stringify(value);
 const normalizeTerm = (term: string) => term.normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
 const ratingMap = { again: Rating.Again, hard: Rating.Hard, good: Rating.Good, easy: Rating.Easy } as const;
+function learningState(item: StudyItem): LearningState {
+  const { version, card, learnedAt, dueAt, lastRating, lapses, needsRelearn } = item;
+  return structuredClone({ version, card, learnedAt, dueAt, lastRating, lapses, needsRelearn });
+}
 
 export class Store {
   readonly db: DatabaseSync;
   private scheduler = fsrs({ request_retention: 0.9, enable_fuzz: false, enable_short_term: false });
   private backupPromise: Promise<BackupFile> | null = null;
+  private resetting = false;
   constructor(readonly dataDir: string, readonly clock: () => Date = () => new Date()) {
     fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     fs.chmodSync(dataDir, 0o700);
@@ -58,11 +63,16 @@ export class Store {
     if (patch.useLatest) { item.needsRelearn = false; item.learnedAt = null; item.dueAt = null; }
     item.updatedAt = this.clock().toISOString(); this.put('items', id, item); return item;
   }
-  completeLearning(itemId: string): StudyItem {
+  private checkGeneration(generation: number | undefined, date: string) {
+    const current = this.get<StoredDailyPlan>('plans', date)?.generation ?? 0;
+    assert((generation ?? 0) === current, '今日学习已被重置，请刷新页面后继续。', 409, 'PLAN_RESET');
+  }
+  completeLearning(itemId: string, planGeneration = 0): StudyItem {
     // Learning is a confirmation action. It intentionally creates no answer
     // record; the English recall belongs to the review stage.
     const plan = this.getDailyPlan();
     return this.transaction(() => {
+      this.checkGeneration(planGeneration, plan.date);
       const item = this.getItem(itemId);
       assert(item.status === 'active', '请先恢复或核对该词条');
       const stored = this.get<StoredDailyPlan>('plans', plan.date);
@@ -74,6 +84,8 @@ export class Store {
       if (!stored.learnedIds.includes(item.id)) stored.learnedIds.push(item.id);
       const now = this.clock();
       if (item.learnedAt === null) {
+        stored.learningBefore ??= {};
+        stored.learningBefore[item.id] ??= learningState(item);
         item.card ||= JSON.parse(encode(createEmptyCard(now)));
         item.learnedAt = now.toISOString();
         item.dueAt = now.toISOString();
@@ -137,6 +149,7 @@ export class Store {
     assert(input.expectedRevision !== undefined && Number.isInteger(input.expectedRevision) && input.expectedRevision >= 0, '请提供 expectedRevision');
     return this.transaction(() => {
       const now = this.clock(); const timestamp = now.toISOString();
+      this.checkGeneration(input.planGeneration, dateKey(now, this.getSettings().timezone));
       const existing = this.get<AnswerRecord>('answers', input.id);
       if (existing) {
         if (input.expectedRevision !== existing.revision) throw new AppError('另一个窗口或设备已更新此回答。你的输入已保留，请核对版本。', 409, 'REVISION_CONFLICT', existing);
@@ -179,14 +192,16 @@ export class Store {
       a.revision++; a.updatedAt = this.clock().toISOString(); this.put('answers', id, a); return a;
     });
   }
-  rateAnswer(answerId: string, rating: RatingLabel) {
+  rateAnswer(answerId: string, rating: RatingLabel, planGeneration = 0) {
     assert(ratings.includes(rating), '掌握程度无效');
     return this.transaction(() => {
+      this.checkGeneration(planGeneration, dateKey(this.clock(), this.getSettings().timezone));
       const a = this.getAnswer(answerId); const item = this.getItem(a.itemId);
       assert(a.status !== 'draft', '请先提交回答');
       const oldReview = this.all<ReviewRecord>('reviews').find(r => r.answerId === answerId);
       if (oldReview) { assert(oldReview.rating === rating, '该回答已经完成自评', 409); return { item, review: oldReview, answer: a }; }
       const now = this.clock();
+      const before = learningState(item);
       let log: Record<string, unknown> = { stage: 'practice', scheduling: false };
       let dueAt = item.dueAt || now.toISOString();
       if (a.stage === 'learn') {
@@ -205,7 +220,7 @@ export class Store {
         item.updatedAt = now.toISOString(); this.put('items', item.id, item);
         log = JSON.parse(encode(result.log));
       }
-      const review: ReviewRecord = { id: randomUUID(), answerId, itemId: item.id, rating, reviewedAt: now.toISOString(), dueAt, log };
+      const review: ReviewRecord = { id: randomUUID(), answerId, itemId: item.id, rating, reviewedAt: now.toISOString(), dueAt, log, before };
       a.rating = rating; a.status = 'rated'; a.revision++; a.updatedAt = now.toISOString();
       this.put('reviews', review.id, review); this.put('answers', a.id, a);
       return { item, review, answer: a };
@@ -220,6 +235,8 @@ export class Store {
     }
     const answers = this.listAnswers({ date });
     const stored = this.get<StoredDailyPlan>('plans', date) || { date, learnIds: [], reviewIds: [], learnedIds: [], questions: [] };
+    const generation = stored.generation ?? 0;
+    const seed = generation ? `${date}:${generation}` : date;
     stored.learnedIds ??= [];
     const legacyLearned = answers.filter(a => a.stage === 'learn' && a.status === 'rated').map(a => a.itemId);
     const plannedLearnIds = new Set(stored.learnIds);
@@ -227,13 +244,13 @@ export class Store {
     const reviewed = new Set(answers.filter(a => a.stage === 'review' && a.status === 'rated').map(a => a.itemId));
     const practiced = new Set(answers.filter(a => a.stage === 'practice' && a.status !== 'draft').map(a => a.questionId));
     const available = items.filter(x => x.status === 'active');
-    const newPool = stableShuffle(available.filter(x => x.learnedAt === null), `${date}:learn`, x => x.id);
+    const newPool = stableShuffle(available.filter(x => x.learnedAt === null), `${seed}:learn`, x => x.id);
     const due = available.filter(x => x.learnedAt !== null && !x.needsRelearn && x.dueAt && Date.parse(x.dueAt) <= now.getTime());
     // Keep today's newly learned entries prominent, while randomizing within
     // both groups so a long due queue does not follow note order.
     const duePool = [
-      ...stableShuffle(due.filter(x => learned.has(x.id)), `${date}:review:new`, x => x.id),
-      ...stableShuffle(due.filter(x => !learned.has(x.id)), `${date}:review:due`, x => x.id),
+      ...stableShuffle(due.filter(x => learned.has(x.id)), `${seed}:review:new`, x => x.id),
+      ...stableShuffle(due.filter(x => !learned.has(x.id)), `${seed}:review:due`, x => x.id),
     ];
     const carriedQuestions = this.all<StoredDailyPlan>('plans').filter(p => p.date !== date).flatMap(p => p.questions).filter(q => answers.some(a => a.stage === 'practice' && a.status === 'draft' && a.questionId === q.id));
     for (const q of carriedQuestions) if (!stored.questions.some(x => x.id === q.id)) stored.questions.push(q);
@@ -256,7 +273,7 @@ export class Store {
     stored.reviewIds = retain(stored.reviewIds, duePool, 'review', reviewed, settings.reviewLimit);
     stored.learnedIds = [...learned].filter(id => stored.learnIds.includes(id));
     const completed = new Set([...learned, ...reviewed]);
-    const practiceItems = stableShuffle(available.filter(x => completed.has(x.id) && !x.needsRelearn), `${date}:practice`, x => x.id);
+    const practiceItems = stableShuffle(available.filter(x => completed.has(x.id) && !x.needsRelearn), `${seed}:practice`, x => x.id);
     const kept = stored.questions.filter(q => {
       const hasAnswer = answers.some(a => a.questionId === q.id);
       const eligible = practiced.has(q.id) || hasAnswer || ((q.manual || completed.has(q.itemId)) && map.get(q.itemId)?.status === 'active');
@@ -267,7 +284,7 @@ export class Store {
     const generated: typeof kept = [];
     for (let round = 0; round < 5; round++) for (const item of practiceItems) {
       const kind = kindsFor(item)[round]; if (!kind) continue;
-      const q = makeQuestion(item, kind, date); const existing = kept.find(x => x.id === q.id);
+      const q = makeQuestion(item, kind, seed); const existing = kept.find(x => x.id === q.id);
       generated.push(existing && (practiced.has(q.id) || answers.some(a => a.questionId === q.id)) ? existing : q);
     }
     const protectedQuestions = kept.filter(q => practiced.has(q.id) || answers.some(a => a.questionId === q.id));
@@ -276,7 +293,7 @@ export class Store {
     stored.questions = selectedQuestions;
     this.put('plans', date, stored);
     return {
-      date, timezone: settings.timezone, studyTime: settings.studyTime,
+      date, generation, timezone: settings.timezone, studyTime: settings.studyTime,
       learn: stored.learnIds.filter(id => !learned.has(id)).map(id => map.get(id)!).filter(Boolean),
       review: stored.reviewIds.filter(id => !reviewed.has(id)).map(id => map.get(id)!).filter(Boolean),
       practice: stored.questions.filter(q => !practiced.has(q.id)),
@@ -301,6 +318,86 @@ export class Store {
     }
     const question = { ...makeQuestion(item, kind, `${daily.date}:manual:${randomUUID()}`), manual: true };
     stored.questions.push(question); this.put('plans', daily.date, stored); return question;
+  }
+  getResetBackup(id: string): BackupData {
+    assert(/^[a-f0-9-]{36}$/.test(id), '重置备份不存在', 404);
+    const file = path.join(this.dataDir, 'resets', `${id}.json`);
+    assert(fs.existsSync(file), '重置备份不存在', 404);
+    const value: unknown = JSON.parse(fs.readFileSync(file, 'utf8'));
+    validateBackup(value); return value;
+  }
+  async resetToday(date: string, generation: number): Promise<DailyResetResult> {
+    assert(!this.resetting && !this.getSyncStatus().running, '同步或重置正在进行，请稍后重试', 409);
+    assert(date === dateKey(this.clock(), this.getSettings().timezone), '日期已变化，请刷新今日计划', 409);
+    this.checkGeneration(generation, date);
+    this.resetting = true;
+    try {
+      const backup = await this.backup();
+      return this.transaction(() => {
+        assert(!this.getSyncStatus().running, '同步正在进行，请稍后重试', 409);
+        const timezone = this.getSettings().timezone;
+        assert(date === dateKey(this.clock(), timezone), '日期已变化，请刷新今日计划', 409);
+        this.checkGeneration(generation, date);
+        const recoveryId = randomUUID();
+        const recoveryDir = path.join(this.dataDir, 'resets');
+        fs.mkdirSync(recoveryDir, { recursive: true, mode: 0o700 });
+        // Capture the exact pre-reset transaction state, including any writes
+        // that arrived while the asynchronous SQLite backup was finishing.
+        fs.writeFileSync(path.join(recoveryDir, `${recoveryId}.json`), encode(this.exportBackup()), { mode: 0o600, flag: 'wx' });
+        const stored = this.get<StoredDailyPlan>('plans', date);
+        const answers = this.listAnswers();
+        const todayAnswers = answers.filter(a => dateKey(new Date(a.createdAt), timezone) === date);
+        const deletedIds = new Set(todayAnswers.map(a => a.id));
+        const reviews = this.all<ReviewRecord>('reviews');
+        const removedReviews = reviews.filter(r => deletedIds.has(r.answerId) || dateKey(new Date(r.reviewedAt), timezone) === date);
+        const removedReviewIds = new Set(removedReviews.map(r => r.id));
+        const affected = new Set([...removedReviews.map(r => r.itemId), ...(stored?.learnedIds ?? []), ...todayAnswers.filter(a => a.stage === 'learn').map(a => a.itemId)]);
+        for (const item of this.listItems()) {
+          if (item.learnedAt && dateKey(new Date(item.learnedAt), timezone) === date) affected.add(item.id);
+          if (!affected.has(item.id)) continue;
+          const undo = [...removedReviews].reverse().filter(r => r.itemId === item.id).sort((a, b) => b.reviewedAt.localeCompare(a.reviewedAt));
+          let state = learningState(item);
+          for (const review of undo) {
+            if (review.before) state = structuredClone(review.before);
+            else if (review.log.scheduling !== false && state.card) {
+              state.card = JSON.parse(encode(this.scheduler.rollback(state.card as unknown as CardInput, review.log as unknown as ReviewLogInput)));
+              state.lapses = Number(state.card!.lapses);
+            }
+          }
+          const learningBefore = stored?.learningBefore?.[item.id];
+          if (learningBefore) state = structuredClone(learningBefore);
+          const prior = reviews.filter(r => r.itemId === item.id && !removedReviewIds.has(r.id) && r.log.scheduling !== false)
+            .sort((a, b) => b.reviewedAt.localeCompare(a.reviewedAt))[0];
+          // Legacy records have no before snapshot. Restore their precise due
+          // time from the last retained FSRS record after rolling logs back.
+          if (!learningBefore && undo.some(r => !r.before)) {
+            if (prior) {
+              state.dueAt = prior.dueAt; state.lastRating = prior.rating;
+              if (state.card) state.card.due = prior.dueAt;
+            } else if (item.learnedAt && dateKey(new Date(item.learnedAt), timezone) === date) {
+              state = { ...state, card: null, learnedAt: null, dueAt: null, lastRating: null, lapses: 0, needsRelearn: false };
+            }
+          } else if (!learningBefore && undo.length === 0 && item.learnedAt && dateKey(new Date(item.learnedAt), timezone) === date && !prior) {
+            state = { ...state, card: null, learnedAt: null, dueAt: null, lastRating: null, lapses: 0, needsRelearn: false };
+          }
+          const { version: learnedVersion, ...fields } = state;
+          Object.assign(item, fields);
+          item.needsRelearn = state.needsRelearn || (item.learnedAt !== null && item.version !== learnedVersion);
+          item.updatedAt = this.clock().toISOString(); this.put('items', item.id, item);
+        }
+        for (const review of removedReviews) {
+          this.db.prepare('DELETE FROM reviews WHERE id=?').run(review.id);
+          if (!deletedIds.has(review.answerId)) {
+            const answer = this.getAnswer(review.answerId);
+            answer.rating = null; answer.status = 'submitted'; answer.revision++;
+            answer.updatedAt = this.clock().toISOString(); this.put('answers', answer.id, answer);
+          }
+        }
+        for (const answer of todayAnswers) this.db.prepare('DELETE FROM answers WHERE id=?').run(answer.id);
+        this.put('plans', date, { date, generation: generation + 1, learnIds: [], reviewIds: [], learnedIds: [], learningBefore: {}, questions: [] } satisfies StoredDailyPlan);
+        return { plan: this.getDailyPlan(), recoveryId, backup };
+      });
+    } finally { this.resetting = false; }
   }
   stats(): AppStats {
     const items = this.listItems(); const active = items.filter(x => x.status === 'active');

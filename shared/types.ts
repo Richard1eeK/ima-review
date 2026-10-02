@@ -44,7 +44,7 @@ export interface Question {
   prompt: string; reference: string[]; item: StudyItem; manual?: boolean;
 }
 export interface DailyPlan {
-  date: string; timezone: string; studyTime: string;
+  date: string; generation: number; timezone: string; studyTime: string;
   learn: StudyItem[]; review: StudyItem[]; practice: Question[];
   counts: { learned: number; reviewed: number; practiced: number; dueTotal: number; remainingNew: number };
   limits: { newLimit: number; reviewLimit: number; practiceLimit: number };
@@ -59,17 +59,19 @@ export interface AnswerRecord {
 }
 export interface ReviewRecord {
   id: string; answerId: string; itemId: string; rating: RatingLabel;
-  reviewedAt: string; dueAt: string; log: Record<string, unknown>;
+  reviewedAt: string; dueAt: string; log: Record<string, unknown>; before?: LearningState;
 }
+export type LearningState = Pick<StudyItem, 'version' | 'card' | 'learnedAt' | 'dueAt' | 'lastRating' | 'lapses' | 'needsRelearn'>;
+export interface DailyResetResult { plan: DailyPlan; recoveryId: string; backup: BackupFile }
 export interface AnswerInput {
   id: string; itemId: string; stage: StudyStage; questionId?: string;
   questionKind?: QuestionKind; originalAnswer: string; submit?: boolean;
-  expectedRevision?: number;
+  expectedRevision?: number; planGeneration?: number;
 }
 export interface AnswerUpdate {
   revisedAnswer?: string; feedback?: string; expectedRevision: number;
 }
-export interface ReviewInput { answerId: string; rating: RatingLabel }
+export interface ReviewInput { answerId: string; rating: RatingLabel; planGeneration?: number }
 export interface BackupData {
   format: 'ima-review-backup'; version: 1; exportedAt: string;
   settings: Settings; items: StudyItem[]; answers: AnswerRecord[];
@@ -77,7 +79,8 @@ export interface BackupData {
   syncStatus: SyncStatus;
 }
 export interface StoredDailyPlan {
-  date: string; learnIds: string[]; reviewIds: string[]; learnedIds?: string[]; questions: Question[];
+  date: string; generation?: number; learnIds: string[]; reviewIds: string[]; learnedIds?: string[]; questions: Question[];
+  learningBefore?: Record<string, LearningState>;
 }
 export interface AppStats { active: number; archived: number; pending: number; learned: number; weak: number; answers: number }
 export interface BackupFile { name: string; createdAt: string; bytes: number }

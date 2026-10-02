@@ -10,13 +10,15 @@
 | GET /api/items/:id | 无 | StudyItem |
 | PATCH /api/items/:id | status=active/archived；确认资料更新 useLatest=true | StudyItem |
 | GET /api/plan | 无 | DailyPlan（服务器所在设定时区的今天） |
-| POST /api/learning | { itemId: string } | { item: StudyItem, plan: DailyPlan }；记录新学完成，不创建回答 |
+| POST /api/plan/reset | { date: string, generation: number, confirm: true } | DailyResetResult：{ plan, recoveryId, backup } |
+| GET /api/resets/:id | 重置返回的 recoveryId | 重置前的完整 JSON 备份下载 |
+| POST /api/learning | { itemId: string, planGeneration: number } | { item: StudyItem, plan: DailyPlan }；记录新学完成，不创建回答 |
 | POST /api/practice | { itemId: string } | Question，主动重练已学词条；占每日应用题额度 |
 | GET /api/stats | 无 | AppStats |
 | GET /api/answers | itemId、date 可选 | AnswerRecord[] |
-| PUT /api/answers/:id | AnswerInput，id 为客户端 UUID | AnswerRecord |
+| PUT /api/answers/:id | AnswerInput，含 planGeneration；id 为客户端 UUID | AnswerRecord |
 | PATCH /api/answers/:id | AnswerUpdate | AnswerRecord |
-| POST /api/reviews | ReviewInput | { item: StudyItem, review: ReviewRecord, answer: AnswerRecord } |
+| POST /api/reviews | { answerId: string, rating: RatingLabel, planGeneration: number } | { item: StudyItem, review: ReviewRecord, answer: AnswerRecord } |
 | GET /api/sync | 无 | SyncStatus |
 | POST /api/sync | 无 | SyncStatus；同步失败为 502 且保留旧题库 |
 | GET /api/notebooks | 无 | Notebook[]（联网，来自 ima） |
@@ -40,3 +42,19 @@
 已修改的词条 needsRelearn=true，资料更新提示中使用 useLatest 确认后重新学习。归档保留所有历史。pending 表示同步匹配歧义；需先核对，不进入每日计划。
 
 前端请求失败必须保留未保存输入并允许重试。下载用普通链接，一键复制用用户点击触发的剪贴板操作，打印 PDF 使用专门的打印布局。
+
+## 重置今日学习
+
+前端先展示重置范围，确认后用当前 `DailyPlan.date` 和 `DailyPlan.generation` 调用：
+
+```json
+{ "date": "2026-10-02", "generation": 0, "confirm": true }
+```
+
+重置按设置时区的今天执行：撤销今日新学完成和自评，删除 `createdAt` 属于今天的回答，恢复受影响词条的学习与 FSRS 状态，再重新抽取任务。以前开始、今天继续的草稿保留；以前提交但今天自评的回答保留原答，并恢复为待自评。笔记正文、来源、内容版本及归档状态保留。
+
+操作前创建一致性 SQLite 备份，并在提交重置的事务前保存精确的完整 JSON 备份。响应 `backup` 是 SQLite 备份信息，`recoveryId` 用于 `GET /api/resets/:id` 下载 JSON。JSON 可通过现有恢复校验及恢复接口恢复；这是整库恢复，会覆盖重置之后的新记录。
+
+每次重置增加 `DailyPlan.generation`，用于随机抽取、题目 ID 和本地草稿缓存。新学、答案保存和自评请求必须携带当前 `planGeneration`；旧页面继续写入会返回 `409`、`code: "PLAN_RESET"`，应停止保存旧任务并重新加载计划。为兼容旧客户端，缺省代数视为 `0`，第一次重置后缺省值也会被拒绝。重置时卸载正在作答的编辑器，完成后清理旧代数缓存，避免旧草稿进入新任务。
+
+`confirm` 未明确为 `true` 或日期/代数格式无效时返回 `400`；日期已跨日、代数过期、同步或另一项重置正在进行时返回 `409`。发生失败时保留现有计划和输入，不应显示重置成功。

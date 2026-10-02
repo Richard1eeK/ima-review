@@ -65,9 +65,20 @@ export async function createApp(options: AppOptions = {}) {
     return store.updateItem(request.params.id, request.body);
   });
   app.get('/api/plan', async () => store.getDailyPlan());
+  app.post('/api/plan/reset', async request => {
+    object(request.body); assert(request.body.confirm === true, '请确认重置今日学习');
+    text(request.body.date, 'date', 10); checkDateFilter(request.body.date);
+    assert(Number.isSafeInteger(request.body.generation) && Number(request.body.generation) >= 0, '计划版本无效');
+    return store.resetToday(request.body.date, request.body.generation as number);
+  });
+  app.get<{ Params: { id: string } }>('/api/resets/:id', async (request, reply) => {
+    const value = store.getResetBackup(request.params.id);
+    reply.header('Content-Disposition', 'attachment; filename="ima-review-before-reset.json"');
+    return reply.type('application/json; charset=utf-8').send(value);
+  });
   app.post('/api/learning', async request => {
     object(request.body); text(request.body.itemId, 'itemId', 200);
-    const item = store.completeLearning(request.body.itemId);
+    const item = store.completeLearning(request.body.itemId, request.body.planGeneration as number | undefined);
     return { item, plan: store.getDailyPlan() };
   });
   app.post('/api/practice', async request => {
@@ -85,7 +96,7 @@ export async function createApp(options: AppOptions = {}) {
   });
   app.post('/api/reviews', async request => {
     object(request.body); text(request.body.answerId, 'answerId', 200); text(request.body.rating, 'rating', 20);
-    return store.rateAnswer(request.body.answerId, request.body.rating as Parameters<Store['rateAnswer']>[1]);
+    return store.rateAnswer(request.body.answerId, request.body.rating as Parameters<Store['rateAnswer']>[1], request.body.planGeneration as number | undefined);
   });
   app.get('/api/sync', async () => store.getSyncStatus());
   app.post('/api/sync', async () => {

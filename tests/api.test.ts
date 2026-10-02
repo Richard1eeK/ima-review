@@ -6,7 +6,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { createApp } from '../server/app.ts';
 import { Store } from '../server/store.ts';
-import type { ParsedStudyItem } from '../shared/types.ts';
+import type { BackupData, DailyPlan, DailyResetResult, ParsedStudyItem } from '../shared/types.ts';
 
 async function fixture(t: TestContext) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ima-review-api-'));
@@ -55,4 +55,66 @@ test('sync error leaves persisted data available and backup downloads are privat
   assert.equal((await app.inject(`/api/backups/${file.name}`)).statusCode, 200);
   assert.equal((await app.inject('/api/backups/not-found.sqlite')).statusCode, 404);
   assert.equal((await app.inject('/api/export?format=nope')).statusCode, 400);
+});
+
+test('reset API requires confirmation and rejects invalid or stale dates and generations without changing progress', async t => {
+  const { app, store } = await fixture(t);
+  const plan = (await app.inject('/api/plan')).json<DailyPlan>();
+  store.completeLearning(plan.learn[0].id, plan.generation);
+  const request = { method: 'POST' as const, url: '/api/plan/reset' };
+  assert.equal((await app.inject({ ...request, payload: { date: plan.date, generation: plan.generation } })).statusCode, 400);
+  assert.equal((await app.inject({ ...request, payload: { confirm: false, date: plan.date, generation: plan.generation } })).statusCode, 400);
+  assert.equal((await app.inject({ ...request, payload: { confirm: true, date: 'not-a-date', generation: plan.generation } })).statusCode, 400);
+  assert.equal((await app.inject({ ...request, payload: { confirm: true, date: '2026-10-01', generation: plan.generation } })).statusCode, 409);
+  for (const generation of [undefined, -1, 0.5, '0']) {
+    assert.equal((await app.inject({ ...request, payload: { confirm: true, date: plan.date, generation } })).statusCode, 400);
+  }
+  assert.equal((await app.inject({ ...request, payload: { confirm: true, date: plan.date, generation: plan.generation + 1 } })).statusCode, 409);
+  const current = store.getDailyPlan();
+  assert.equal(current.generation, plan.generation);
+  assert.equal(current.counts.learned, 1);
+  assert.equal(store.listBackups().length, 0);
+});
+
+test('reset API clears today, rejects stale writes, and downloads a private recovery JSON that can restore progress', async t => {
+  const { app, store } = await fixture(t);
+  const plan = (await app.inject('/api/plan')).json<DailyPlan>();
+  const itemId = plan.learn[0].id;
+  assert.equal((await app.inject({ method: 'POST', url: '/api/learning', payload: { itemId, planGeneration: plan.generation } })).statusCode, 200);
+  assert.equal((await app.inject({ method: 'PUT', url: '/api/answers/reset-recall', payload: { id: 'reset-recall', itemId, stage: 'review', originalAnswer: 'My explanation.\n原始回答需要恢复。', expectedRevision: 0, submit: true, planGeneration: plan.generation } })).statusCode, 200);
+  assert.equal((await app.inject({ method: 'POST', url: '/api/reviews', payload: { answerId: 'reset-recall', rating: 'hard', planGeneration: plan.generation } })).statusCode, 200);
+  const before = store.exportBackup();
+
+  const response = await app.inject({ method: 'POST', url: '/api/plan/reset', payload: { confirm: true, date: plan.date, generation: plan.generation } });
+  assert.equal(response.statusCode, 200);
+  const reset = response.json<DailyResetResult>();
+  assert.equal(reset.plan.generation, plan.generation + 1);
+  assert.equal(reset.plan.counts.learned, 0);
+  assert.equal(reset.plan.counts.reviewed, 0);
+  assert.equal(reset.plan.counts.practiced, 0);
+  assert.equal(store.listAnswers().length, 0);
+  assert.equal((await app.inject(`/api/backups/${reset.backup.name}`)).statusCode, 200);
+  assert.equal((await app.inject({ method: 'POST', url: '/api/learning', payload: { itemId, planGeneration: plan.generation } })).statusCode, 409);
+  assert.equal((await app.inject({ method: 'PUT', url: '/api/answers/old-autosave', payload: { id: 'old-autosave', itemId, stage: 'learn', originalAnswer: 'Stale tab content.', expectedRevision: 0, planGeneration: plan.generation } })).statusCode, 409);
+  assert.equal((await app.inject({ method: 'POST', url: '/api/reviews', payload: { answerId: 'reset-recall', rating: 'hard', planGeneration: plan.generation } })).statusCode, 409);
+  assert.equal((await app.inject({ method: 'POST', url: '/api/plan/reset', payload: { confirm: true, date: plan.date, generation: plan.generation } })).statusCode, 409);
+
+  const downloadUrl = `/api/resets/${reset.recoveryId}`;
+  assert.equal((await app.inject({ url: downloadUrl, headers: { host: 'mini.private.ts.net', 'tailscale-user-login': 'other@example.com' } })).statusCode, 403);
+  assert.equal((await app.inject('/api/resets/not-a-recovery-id')).statusCode, 404);
+  const downloaded = await app.inject(downloadUrl);
+  assert.equal(downloaded.statusCode, 200);
+  assert.match(downloaded.headers['content-disposition'] as string, /attachment/);
+  assert.match(downloaded.headers['content-type'] as string, /application\/json/);
+  const recovery = downloaded.json<BackupData>();
+  assert.deepEqual(recovery.items, before.items);
+  assert.deepEqual(recovery.answers, before.answers);
+  assert.deepEqual(recovery.reviews, before.reviews);
+  assert.equal((await app.inject({ method: 'POST', url: '/api/restore/validate', payload: recovery })).statusCode, 200);
+  assert.equal((await app.inject({ method: 'POST', url: '/api/learning', payload: { itemId, planGeneration: reset.plan.generation } })).statusCode, 200);
+  assert.equal((await app.inject({ method: 'POST', url: '/api/restore', payload: { confirm: true, backup: recovery } })).statusCode, 200);
+  assert.deepEqual(store.exportBackup().items, before.items);
+  assert.deepEqual(store.exportBackup().answers, before.answers);
+  assert.deepEqual(store.exportBackup().reviews, before.reviews);
+  assert.equal(store.getDailyPlan().generation, plan.generation);
 });

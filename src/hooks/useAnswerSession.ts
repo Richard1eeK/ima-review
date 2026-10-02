@@ -68,7 +68,7 @@ export function useAnswerSession(options: SessionOptions) {
     recordRef.current = next;
     revisionRef.current = next.revision;
     if (mountedRef.current) setRecord(next);
-    optionsRef.current.onRecord(next);
+    if (mountedRef.current) optionsRef.current.onRecord(next);
     persist();
   }, [persist]);
 
@@ -89,7 +89,7 @@ export function useAnswerSession(options: SessionOptions) {
           submit, expectedRevision: revisionRef.current,
         } satisfies AnswerInput);
         publish(next);
-        if (submit) optionsRef.current.onCompleted();
+        if (submit && mountedRef.current) optionsRef.current.onCompleted();
         return true;
       } catch (cause) {
         if (cause instanceof RequestError && cause.status === 409 && cause.current) {
@@ -158,9 +158,9 @@ export function useAnswerSession(options: SessionOptions) {
     setRating(true);
     setError('');
     try {
-      const result = await write<{ item: StudyItem; review: ReviewRecord; answer: AnswerRecord }>('/api/reviews', 'POST', { answerId: current.id, rating: value });
+      const result = await write<{ item: StudyItem; review: ReviewRecord; answer: AnswerRecord }>('/api/reviews', 'POST', { answerId: current.id, rating: value, planGeneration: optionsRef.current.input.planGeneration });
       publish(result.answer);
-      optionsRef.current.onCompleted();
+      if (mountedRef.current) optionsRef.current.onCompleted();
     } catch (cause) { if (mountedRef.current) setError(message(cause)); }
     finally { ratingLockRef.current = false; if (mountedRef.current) setRating(false); }
   }, [publish]);

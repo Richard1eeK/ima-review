@@ -8,13 +8,13 @@ export interface AnswerTask {
   item: StudyItem; stage: StudyStage; questionId?: string; kind: QuestionKind; prompt: string;
 }
 
-export function AnswerEditor({ task, date, initial, onRecord, onCompleted, onNext }: {
-  task: AnswerTask; date: string; initial?: AnswerRecord;
+export function AnswerEditor({ task, date, generation = 0, initial, onRecord, onCompleted, onNext }: {
+  task: AnswerTask; date: string; generation?: number; initial?: AnswerRecord;
   onRecord: (record: AnswerRecord) => void; onCompleted: () => void; onNext: () => void;
 }) {
-  const sessionKey = `${date}:${task.stage}:${task.questionId ?? task.item.id}`;
+  const sessionKey = `${date}:${generation ? `g${generation}:` : ''}${task.stage}:${task.questionId ?? task.item.id}`;
   const session = useAnswerSession({ sessionKey, initial,
-    input: { itemId: task.item.id, stage: task.stage, questionId: task.questionId, questionKind: task.kind },
+    input: { itemId: task.item.id, stage: task.stage, questionId: task.questionId, questionKind: task.kind, planGeneration: generation },
     onRecord, onCompleted,
   });
   const submitted = !!session.record && session.record.status !== 'draft';
