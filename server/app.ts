@@ -65,6 +65,11 @@ export async function createApp(options: AppOptions = {}) {
     return store.updateItem(request.params.id, request.body);
   });
   app.get('/api/plan', async () => store.getDailyPlan());
+  app.post('/api/learning', async request => {
+    object(request.body); text(request.body.itemId, 'itemId', 200);
+    const item = store.completeLearning(request.body.itemId);
+    return { item, plan: store.getDailyPlan() };
+  });
   app.post('/api/practice', async request => {
     object(request.body); text(request.body.itemId, 'itemId', 200);
     return store.addPractice(request.body.itemId);

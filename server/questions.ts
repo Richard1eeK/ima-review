@@ -4,8 +4,10 @@ export function referenceFor(item: StudyItem): string[] {
   return [item.title, ...item.body];
 }
 export function kindsFor(item: StudyItem): QuestionKind[] {
-  if (item.needsSupplement) return ['explain'];
-  const kinds: QuestionKind[] = ['explain', 'sentence'];
+  // Application practice must make the learner use the expression. An
+  // explanation prompt belongs to recall, not to the application queue.
+  if (item.needsSupplement) return [];
+  const kinds: QuestionKind[] = ['sentence'];
   if (item.members.length > 1) kinds.push('contrast');
   if (item.speaking.length && item.writing.length) kinds.push('register');
   if (item.warnings.length) kinds.push('pitfall');
@@ -13,12 +15,16 @@ export function kindsFor(item: StudyItem): QuestionKind[] {
 }
 export function promptFor(item: StudyItem, kind: QuestionKind): string {
   switch (kind) {
-    case 'contrast': return `Explain the differences between ${item.members.join(' / ')} in your own English. Give a suitable context for each and explain why they are not always interchangeable.`;
-    case 'sentence': return `Write a natural English sentence using “${item.term}”. Briefly explain the situation and why this expression fits.`;
-    case 'register': return `Using “${item.term}”, write one conversational version and one version suitable for formal writing. Explain the difference in tone or usage.`;
-    case 'pitfall': return `Explain a common mistake or usage restriction for “${item.term}” in your own English, then show a correct example.`;
+    case 'contrast': return `Choose the best expression from ${item.members.join(' / ')} for a situation of your own, then write one natural sentence that makes the choice clear.`;
+    case 'sentence': return `Write one natural English sentence using “${item.term}”.`;
+    case 'register': return `Write one conversational sentence using “${item.term}”, then rewrite it in a suitable formal style.`;
+    case 'pitfall': return `Write one correct English sentence using “${item.term}” while avoiding the usage mistake described in the note.`;
     default: return `Explain “${item.term}” in your own English. Describe the meaning and, where relevant, its tone or usage. Avoid copying the note word for word.`;
   }
+}
+export function stableShuffle<T>(items: T[], seed: string, key: (item: T) => string): T[] {
+  const order = (item: T) => createHash('sha256').update(`${seed}:${key(item)}`).digest('hex');
+  return [...items].sort((a, b) => order(a).localeCompare(order(b)) || key(a).localeCompare(key(b)));
 }
 export function makeQuestion(item: StudyItem, kind: QuestionKind, date: string): Question {
   const id = createHash('sha256').update(`${date}:${item.id}:${kind}`).digest('hex').slice(0, 24);

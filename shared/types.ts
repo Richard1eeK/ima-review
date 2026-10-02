@@ -77,7 +77,7 @@ export interface BackupData {
   syncStatus: SyncStatus;
 }
 export interface StoredDailyPlan {
-  date: string; learnIds: string[]; reviewIds: string[]; questions: Question[];
+  date: string; learnIds: string[]; reviewIds: string[]; learnedIds?: string[]; questions: Question[];
 }
 export interface AppStats { active: number; archived: number; pending: number; learned: number; weak: number; answers: number }
 export interface BackupFile { name: string; createdAt: string; bytes: number }

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { Store } from '../server/store.ts';
 import { csvExport, evaluationPack, markdownExport } from '../server/export.ts';
+import { stableShuffle } from '../server/questions.ts';
 import { validateBackup } from '../server/validation.ts';
 import { startScheduler } from '../server/scheduler.ts';
 import type { ParsedStudyItem } from '../shared/types.ts';
@@ -60,7 +61,7 @@ test('daily limits, stable drafts, conflict handling, idempotent ratings and pra
   assert.throws(() => store.saveAnswer({ id: 'draft', itemId: id, stage: 'learn', originalAnswer: 'overwrite', expectedRevision: submitted.revision }), /原始回答已提交/);
   const rated = store.rateAnswer('draft', 'good'); assert.equal(store.rateAnswer('draft', 'good').review.id, rated.review.id);
   assert.equal(store.getDailyPlan().counts.learned, 1); assert.equal(store.getDailyPlan().learn.length, 0);
-  assert.equal(store.getDailyPlan().review[0].id, id); assert.equal(store.getDailyPlan().practice.length, 0);
+  assert.equal(store.getDailyPlan().review[0].id, id); assert.equal(store.getDailyPlan().practice.length, 2);
   const recall = submit(store, id, 'recall-1', 'review'); store.rateAnswer(recall.id, 'good');
   const q = store.getDailyPlan().practice[0]; const before = JSON.stringify(store.getItem(id).card);
   store.saveAnswer({ id: 'practice-1', itemId: id, stage: 'practice', questionId: q.id, originalAnswer: 'I would use it here.', expectedRevision: 0, submit: true });
@@ -100,16 +101,35 @@ test('automatic scheduler calls ima only at startup, daily and the next day; err
   assert.deepEqual(calls, ['startup', 'daily']); await scheduler.tick(); await scheduler.tick(); assert.equal(calls.length, 2);
   setTime('2026-10-03T02:00:00Z'); await scheduler.tick(); assert.equal(calls.length, 3); assert.equal(calls.at(-1), 'daily');
 });
-test('first learning leads to hidden-answer recall before any application questions or FSRS advancement', t => {
+test('learning confirmation creates no answer, then review schedules recall and application practice', t => {
   const { store } = fixture(t); store.applySync([entry('wing it')], [], '2026-10-02T02:00:00Z');
   const id = store.getDailyPlan().learn[0].id;
-  store.rateAnswer(submit(store, id).id, 'good');
+  store.completeLearning(id);
+  assert.equal(store.listAnswers().length, 0);
   assert.equal(store.getItem(id).card!.reps, 0);
-  assert.equal(store.getDailyPlan().practice.length, 0);
+  assert.ok(store.getDailyPlan().practice.length > 0);
+  assert.ok(store.getDailyPlan().practice.every(question => question.kind !== 'explain'));
   assert.equal(store.getDailyPlan().review[0].id, id);
   store.rateAnswer(submit(store, id, 'recall', 'review').id, 'good');
   assert.equal(store.getItem(id).card!.reps, 1);
   assert.ok(store.getDailyPlan().practice.length > 0);
+});
+test('daily new-learning selection is stable across reloads and completion is idempotent', t => {
+  const { store } = fixture(t); store.saveSettings({ newLimit: 3 });
+  const source = ['a', 'b', 'c', 'd', 'e', 'f'];
+  const shuffled = stableShuffle(source, '2026-10-02:learn', value => value);
+  assert.notDeepEqual(shuffled, source); assert.deepEqual(stableShuffle(source, '2026-10-02:learn', value => value), shuffled);
+  store.applySync(['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot'].map(term => entry(term)), [], '2026-10-02T02:00:00Z');
+  const first = store.getDailyPlan(); const firstIds = first.learn.map(item => item.id);
+  const secondIds = store.getDailyPlan().learn.map(item => item.id);
+  assert.deepEqual(secondIds, firstIds);
+  const itemId = firstIds[0];
+  store.completeLearning(itemId); store.completeLearning(itemId);
+  assert.equal(store.listAnswers().length, 0);
+  const after = store.getDailyPlan();
+  assert.equal(after.counts.learned, 1);
+  assert.ok(after.review.some(item => item.id === itemId));
+  assert.ok(after.practice.every(question => question.kind !== 'explain'));
 });
 test('manual weak-item practice survives reload and keeps the daily practice cap', t => {
   const { store } = fixture(t); store.saveSettings({ practiceLimit: 1 });

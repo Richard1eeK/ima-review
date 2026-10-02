@@ -93,7 +93,8 @@ export function validateBackup(value: unknown): asserts value is BackupData {
   for (const p of value.plans as Record<string, unknown>[]) {
     object(p); text(p.date, 'plan.date', 10); assert(/^\d{4}-\d{2}-\d{2}$/.test(p.date), '计划日期无效');
     strings(p.learnIds, 'plan.learnIds'); strings(p.reviewIds, 'plan.reviewIds');
-    assert([...(p.learnIds as string[]), ...(p.reviewIds as string[])].every(id => itemIds.has(id)), '计划引用不存在的词条');
+    if (p.learnedIds !== undefined) strings(p.learnedIds, 'plan.learnedIds');
+    assert([...(p.learnIds as string[]), ...(p.reviewIds as string[]), ...((p.learnedIds as string[] | undefined) ?? [])].every(id => itemIds.has(id)), '计划引用不存在的词条');
     assert(Array.isArray(p.questions), '计划题目无效');
     for (const q of p.questions) { object(q); text(q.id, 'question.id', 200); assert(itemIds.has(q.itemId), '题目引用不存在的词条'); text(q.prompt, 'question.prompt'); strings(q.reference, 'question.reference'); checkItem(q.item); }
   }

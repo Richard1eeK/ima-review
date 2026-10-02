@@ -32,18 +32,17 @@ test('API validates settings and rejects cross-origin or unauthorized network ac
 test('API walks learning → review rating → practice → export with server snapshots', async t => {
   const { app } = await fixture(t);
   const plan = (await app.inject('/api/plan')).json(); const itemId = plan.learn[0].id;
-  const a = await app.inject({ method: 'PUT', url: '/api/answers/test-answer', payload: { id: 'test-answer', itemId, stage: 'learn', originalAnswer: 'My words. 中文', expectedRevision: 0, submit: true } });
-  assert.equal(a.statusCode, 200); assert.equal(a.json().status, 'submitted');
-  const rating = await app.inject({ method: 'POST', url: '/api/reviews', payload: { answerId: 'test-answer', rating: 'good' } });
-  assert.equal(rating.statusCode, 200); assert.equal(rating.json().answer.status, 'rated');
+  const learning = await app.inject({ method: 'POST', url: '/api/learning', payload: { itemId } });
+  assert.equal(learning.statusCode, 200); assert.equal(learning.json().item.id, itemId);
+  assert.equal((await app.inject('/api/answers')).json().length, 0);
   const updatedPlan = (await app.inject('/api/plan')).json(); assert.equal(updatedPlan.counts.learned, 1); assert.equal(updatedPlan.learn.length, 0);
-  assert.equal(updatedPlan.practice.length, 0); assert.equal(updatedPlan.review[0].id, itemId);
+  assert.equal(updatedPlan.review[0].id, itemId); assert.ok(updatedPlan.practice.length > 0); assert.ok(updatedPlan.practice.every((q: { kind: string }) => q.kind !== 'explain'));
   const recall = await app.inject({ method: 'PUT', url: '/api/answers/test-recall', payload: { id: 'test-recall', itemId, stage: 'review', originalAnswer: 'My independent recall.', expectedRevision: 0, submit: true } });
   assert.equal(recall.statusCode, 200);
   await app.inject({ method: 'POST', url: '/api/reviews', payload: { answerId: 'test-recall', rating: 'good' } });
   assert.ok((await app.inject('/api/plan')).json().practice.length > 0);
-  const exportMD = await app.inject('/api/export?format=markdown'); assert.equal(exportMD.statusCode, 200); assert.match(exportMD.body, /中文/); assert.match(exportMD.headers['content-disposition'] as string, /attachment/);
-  const copyPack = (await app.inject('/api/evaluation')).json(); assert.match(copyPack.text, /My words/);
+  const exportMD = await app.inject('/api/export?format=markdown'); assert.equal(exportMD.statusCode, 200); assert.match(exportMD.body, /含义/); assert.match(exportMD.headers['content-disposition'] as string, /attachment/);
+  const copyPack = (await app.inject('/api/evaluation')).json(); assert.match(copyPack.text, /My independent recall/);
   const backup = (await app.inject('/api/export?format=json')).json();
   assert.equal((await app.inject({ method: 'POST', url: '/api/restore/validate', payload: backup })).statusCode, 200);
   assert.equal((await app.inject({ method: 'POST', url: '/api/restore', payload: { backup, confirm: false } })).statusCode, 400);

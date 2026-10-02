@@ -6,7 +6,7 @@ import { createEmptyCard, fsrs, Rating, type CardInput } from 'ts-fsrs';
 import { defaultSettings, emptySyncStatus } from '../shared/defaults.ts';
 import type { AnswerInput, AnswerRecord, AnswerUpdate, AppStats, BackupData, BackupFile, DailyPlan, NoteSnapshot, ParsedStudyItem, RatingLabel, ReviewRecord, Settings, StoredDailyPlan, StudyItem, SyncCounts, SyncStatus } from '../shared/types.ts';
 import { assert, AppError } from './errors.ts';
-import { dateKey, kindsFor, makeQuestion, promptFor, referenceFor } from './questions.ts';
+import { dateKey, kindsFor, makeQuestion, promptFor, referenceFor, stableShuffle } from './questions.ts';
 import { ratings, text, validateBackup, validateSettings } from './validation.ts';
 import { resolveConfig } from './config.ts';
 
@@ -57,6 +57,32 @@ export class Store {
     if (patch.status) { item.status = patch.status; this.setMeta(`archiveReason:${id}`, patch.status === 'archived' ? 'manual' : null); }
     if (patch.useLatest) { item.needsRelearn = false; item.learnedAt = null; item.dueAt = null; }
     item.updatedAt = this.clock().toISOString(); this.put('items', id, item); return item;
+  }
+  completeLearning(itemId: string): StudyItem {
+    // Learning is a confirmation action. It intentionally creates no answer
+    // record; the English recall belongs to the review stage.
+    const plan = this.getDailyPlan();
+    return this.transaction(() => {
+      const item = this.getItem(itemId);
+      assert(item.status === 'active', '请先恢复或核对该词条');
+      const stored = this.get<StoredDailyPlan>('plans', plan.date);
+      assert(stored, '今日计划不存在，请重新加载');
+      stored.learnedIds ??= [];
+      if (!stored.learnIds.includes(item.id) && !stored.learnedIds.includes(item.id)) {
+        throw new AppError('该词条不在今日新学计划内', 409, 'NOT_IN_PLAN');
+      }
+      if (!stored.learnedIds.includes(item.id)) stored.learnedIds.push(item.id);
+      const now = this.clock();
+      if (item.learnedAt === null) {
+        item.card ||= JSON.parse(encode(createEmptyCard(now)));
+        item.learnedAt = now.toISOString();
+        item.dueAt = now.toISOString();
+        item.updatedAt = now.toISOString();
+        this.put('items', item.id, item);
+      }
+      this.put('plans', plan.date, stored);
+      return item;
+    });
   }
   applySync(parsed: ParsedStudyItem[], snapshots: NoteSnapshot[], now: string): SyncCounts {
     return this.transaction(() => {
@@ -193,13 +219,22 @@ export class Store {
       answer.date = date; answer.revision++; answer.updatedAt = now.toISOString(); this.put('answers', answer.id, answer);
     }
     const answers = this.listAnswers({ date });
-    const learned = new Set(answers.filter(a => a.stage === 'learn' && a.status === 'rated').map(a => a.itemId));
+    const stored = this.get<StoredDailyPlan>('plans', date) || { date, learnIds: [], reviewIds: [], learnedIds: [], questions: [] };
+    stored.learnedIds ??= [];
+    const legacyLearned = answers.filter(a => a.stage === 'learn' && a.status === 'rated').map(a => a.itemId);
+    const plannedLearnIds = new Set(stored.learnIds);
+    const learned = new Set([...stored.learnedIds, ...legacyLearned].filter(id => plannedLearnIds.has(id)));
     const reviewed = new Set(answers.filter(a => a.stage === 'review' && a.status === 'rated').map(a => a.itemId));
     const practiced = new Set(answers.filter(a => a.stage === 'practice' && a.status !== 'draft').map(a => a.questionId));
     const available = items.filter(x => x.status === 'active');
-    const newPool = available.filter(x => x.learnedAt === null).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.term.localeCompare(b.term));
-    const duePool = available.filter(x => x.learnedAt !== null && !x.needsRelearn && x.dueAt && Date.parse(x.dueAt) <= now.getTime()).sort((a, b) => Number(learned.has(b.id)) - Number(learned.has(a.id)) || String(a.dueAt).localeCompare(String(b.dueAt)));
-    const stored = this.get<StoredDailyPlan>('plans', date) || { date, learnIds: [], reviewIds: [], questions: [] };
+    const newPool = stableShuffle(available.filter(x => x.learnedAt === null), `${date}:learn`, x => x.id);
+    const due = available.filter(x => x.learnedAt !== null && !x.needsRelearn && x.dueAt && Date.parse(x.dueAt) <= now.getTime());
+    // Keep today's newly learned entries prominent, while randomizing within
+    // both groups so a long due queue does not follow note order.
+    const duePool = [
+      ...stableShuffle(due.filter(x => learned.has(x.id)), `${date}:review:new`, x => x.id),
+      ...stableShuffle(due.filter(x => !learned.has(x.id)), `${date}:review:due`, x => x.id),
+    ];
     const carriedQuestions = this.all<StoredDailyPlan>('plans').filter(p => p.date !== date).flatMap(p => p.questions).filter(q => answers.some(a => a.stage === 'practice' && a.status === 'draft' && a.questionId === q.id));
     for (const q of carriedQuestions) if (!stored.questions.some(x => x.id === q.id)) stored.questions.push(q);
     const map = new Map(items.map(x => [x.id, x]));
@@ -208,7 +243,10 @@ export class Store {
       const eligible = new Set(pool.map(x => x.id));
       const remaining = ids.filter(id => !done.has(id) && map.get(id)?.status === 'active' && (eligible.has(id) || started(id, stage)));
       const locked = remaining.filter(id => started(id, stage));
-      const optional = remaining.filter(id => !started(id, stage));
+      const poolOrder = new Map(pool.map((item, index) => [item.id, index]));
+      // Reorder unfinished entries through the date-stable pool order so a
+      // plan created by the old import-order selector is migrated on reload.
+      const optional = remaining.filter(id => !started(id, stage)).sort((a, b) => (poolOrder.get(a) ?? Number.MAX_SAFE_INTEGER) - (poolOrder.get(b) ?? Number.MAX_SAFE_INTEGER));
       const capacity = Math.max(0, limit - done.size - locked.length);
       const selected = [...locked, ...optional.slice(0, capacity)];
       for (const item of pool) if (!done.has(item.id) && !selected.includes(item.id) && selected.length < Math.max(locked.length, limit - done.size)) selected.push(item.id);
@@ -216,9 +254,16 @@ export class Store {
     };
     stored.learnIds = retain(stored.learnIds, newPool, 'learn', learned, settings.newLimit);
     stored.reviewIds = retain(stored.reviewIds, duePool, 'review', reviewed, settings.reviewLimit);
-    const completed = new Set(reviewed);
-    const practiceItems = available.filter(x => completed.has(x.id) && !x.needsRelearn);
-    const kept = stored.questions.filter(q => practiced.has(q.id) || answers.some(a => a.questionId === q.id) || ((q.manual || completed.has(q.itemId)) && map.get(q.itemId)?.status === 'active'));
+    stored.learnedIds = [...learned].filter(id => stored.learnIds.includes(id));
+    const completed = new Set([...learned, ...reviewed]);
+    const practiceItems = stableShuffle(available.filter(x => completed.has(x.id) && !x.needsRelearn), `${date}:practice`, x => x.id);
+    const kept = stored.questions.filter(q => {
+      const hasAnswer = answers.some(a => a.questionId === q.id);
+      const eligible = practiced.has(q.id) || hasAnswer || ((q.manual || completed.has(q.itemId)) && map.get(q.itemId)?.status === 'active');
+      // Unstarted legacy explanation questions are replaced by application
+      // questions; submitted/draft records remain available for history.
+      return q.kind !== 'explain' && eligible || q.kind === 'explain' && hasAnswer;
+    });
     const generated: typeof kept = [];
     for (let round = 0; round < 5; round++) for (const item of practiceItems) {
       const kind = kindsFor(item)[round]; if (!kind) continue;
@@ -242,6 +287,8 @@ export class Store {
   addPractice(itemId: string) {
     const item = this.getItem(itemId);
     assert(item.status === 'active' && item.learnedAt !== null && !item.needsRelearn, '请先学习并核对该词条的最新资料');
+    const kind = kindsFor(item)[0];
+    assert(kind, '该词条资料不足，暂时没有可生成的应用题', 409, 'PRACTICE_UNAVAILABLE');
     const daily = this.getDailyPlan();
     const stored = this.get<StoredDailyPlan>('plans', daily.date)!;
     const answers = this.listAnswers({ date: daily.date });
@@ -252,7 +299,7 @@ export class Store {
       assert(removable >= 0 && daily.limits.practiceLimit > 0, '今日练习额度已用完，请在设置中增加数量', 409, 'DAILY_LIMIT');
       stored.questions.splice(removable, 1);
     }
-    const question = { ...makeQuestion(item, 'explain', `${daily.date}:manual:${randomUUID()}`), manual: true };
+    const question = { ...makeQuestion(item, kind, `${daily.date}:manual:${randomUUID()}`), manual: true };
     stored.questions.push(question); this.put('plans', daily.date, stored); return question;
   }
   stats(): AppStats {
