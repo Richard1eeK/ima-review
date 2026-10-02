@@ -1,0 +1,35 @@
+{
+  "name": "ima-english-review",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24.0.0" },
+  "scripts": {
+    "dev": "IMA_REVIEW_ALLOWED_ORIGINS=http://127.0.0.1:5189,http://localhost:5189 tsx watch server/index.ts",
+    "dev:ui": "vite --host 127.0.0.1 --port 5189",
+    "build": "tsc --noEmit && vite build",
+    "start": "tsx server/index.ts",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "sync": "tsx scripts/sync.ts",
+    "backup": "tsx scripts/backup.ts",
+    "service:install": "node scripts/launchagent.mjs install",
+    "service:uninstall": "node scripts/launchagent.mjs uninstall",
+    "service:status": "node scripts/launchagent.mjs status"
+  },
+  "dependencies": {
+    "@fastify/static": "10.1.5",
+    "fastify": "5.12.5",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "ts-fsrs": "5.4.2",
+    "tsx": "^4.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^6.0.0",
+    "typescript": "^5.9.0",
+    "vite": "8.3.2"
+  }
+}

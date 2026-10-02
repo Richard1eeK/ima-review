@@ -1,0 +1,6 @@
+import type { AnswerRecord } from '../../shared/types';
+import { answerStatus, questionLabels, ratingLabel, sourceLabel, stageLabels } from '../lib';
+
+export function PrintReport({ records, date }: { records: AnswerRecord[]; date: string }) {
+  return <div className="print-report"><header><h1>温故 · 英语作答档案</h1><p>{date || '全部日期'} · {records.length} 份作答</p></header>{records.map((record, index) => <article className="print-answer" key={record.id}><div className="print-answer-meta">{String(index + 1).padStart(2, '0')} · {record.date} · {stageLabels[record.stage]} · {questionLabels[record.questionKind]} · {record.rating ? ratingLabel(record.rating) : answerStatus(record.status)}</div><h2>{record.prompt}</h2><p className="print-source">来源：{sourceLabel(record.source)} · 资料版本 {record.itemVersion}</p><h3>原始回答</h3><p className="answer-text">{record.originalAnswer || '空白草稿'}</p>{record.revisedAnswer && <><h3>修订回答</h3><p className="answer-text">{record.revisedAnswer}</p></>}{record.feedback && <><h3>评阅反馈</h3><p className="answer-text">{record.feedback}</p></>}{record.status !== 'draft' && <><h3>笔记参考</h3>{record.reference.map((line, lineIndex) => <p key={lineIndex}>{line}</p>)}</>}</article>)}</div>;
+}
